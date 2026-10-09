@@ -2,6 +2,11 @@ name: Build AyuGram IPA
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - trigger-build
 
 permissions:
   contents: write
