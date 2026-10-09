@@ -1,0 +1,103 @@
+name: Build AyuGram IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Clone AyuGram iOS
+        run: |
+          git clone --recursive -j8 https://github.com/maksakks/Ayugram-iOS.git /Users/Shared/telegram-ios
+
+      - name: Select required Xcode
+        run: |
+          cd /Users/Shared/telegram-ios
+          sudo xcode-select -s "/Applications/Xcode_16.4.app/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build unsigned IPA
+        run: |
+          set -euxo pipefail
+          SOURCE_DIR=/Users/Shared/telegram-ios
+          BAZEL_USER_ROOT=/private/var/tmp/_bazel_containerhost
+          cd "$SOURCE_DIR"
+
+          BUILD_NUMBER_OFFSET=$(cat build_number_offset)
+          APP_VERSION=$(cat versions.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["app"])')
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          BUILD_NUMBER=$((COMMIT_COUNT + BUILD_NUMBER_OFFSET))
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+          python3 -c 'import json; p="build-system/appstore-configuration.json"; d=json.load(open(p)); d["sg_config"]=""; open(p,"w").write(json.dumps(d))'
+          python3 -c 'p="submodules/TabBarUI/Sources/TabBarController.swift"; s=open(p).read(); old="sgTabBarHeightModifier(showTabNames: self.showTabNames, "; assert s.count(old)==4; open(p,"w").write(s.replace(old,"sgTabBarHeightModifier("))'
+          python3 -c 'p="submodules/TabBarUI/Sources/TabBarNode.swift"; s=open(p).read(); marker="import TelegramAnimatedStickerNode\n"; assert marker in s; assert "import SGSimpleSettings" not in s; open(p,"w").write(s.replace(marker,marker+"import SGSimpleSettings\n",1))'
+          python3 -c 'p="submodules/TelegramUI/Sources/TelegramRootController.swift"; s=open(p).read(); old="TabBarControllerImpl(showTabNames: self.showTabNames, "; assert s.count(old)==1; open(p,"w").write(s.replace(old,"TabBarControllerImpl("))'
+          python3 -c 'p="submodules/TelegramUI/Sources/ApplicationContext.swift"; s=open(p).read(); old="TelegramRootController(context: context)"; assert s.count(old)==1; open(p,"w").write(s.replace(old,"TelegramRootController(showTabNames: SGSimpleSettings.shared.showTabNames, context: context)"))'
+
+          cp build-system/fake-codesigning/BroadcastUpload.mobileprovision build-system/fake-codesigning/profiles/BroadcastUpload.mobileprovision
+          python3 -c 'p="build-system/bazel-rules/rules_apple/tools/plisttool/plisttool.py"; s=open(p).read(); old="if expire and expire < datetime.datetime.now():"; assert old in s; open(p,"w").write(s.replace(old,"if False and expire and expire < datetime.datetime.now():"))'
+          python3 -c 'p="build-system/bazel-rules/rules_apple/tools/codesigningtool/codesigningtool.py"; s=open(p).read(); old="  mpf = _parse_mobileprovision_file(mobileprovision)"; assert old in s; open(p,"w").write(s.replace(old,"  return \"-\"\n  mpf = _parse_mobileprovision_file(mobileprovision)",1))'
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+
+          IDENTITY="Apple Distribution: Telegram FZ-LLC (C67CF9S4VU)"
+          for PROFILE in build-system/fake-codesigning/profiles/*.mobileprovision; do
+            TMP_PROFILE=$(mktemp)
+            python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1:], check=True, timeout=60)' security cms -D -i "$PROFILE" > "$TMP_PROFILE"
+            python3 -c 'import plistlib,sys; p=sys.argv[1]; c=open(sys.argv[2],"rb").read(); d=plistlib.load(open(p,"rb")); d["DeveloperCertificates"]=[c]; plistlib.dump(d,open(p,"wb"))' "$TMP_PROFILE" build-system/fake-codesigning/certs/Public.cer
+            python3 -c 'import subprocess,sys; subprocess.run(sys.argv[1:], check=True, timeout=60)' security cms -S -N "$IDENTITY" -i "$TMP_PROFILE" -o "$PROFILE"
+            rm "$TMP_PROFILE"
+          done
+          security find-identity -v -p codesigning temp.keychain
+
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot="$BAZEL_USER_ROOT" \
+            --overrideXcodeVersion \
+            build \
+            --configurationPath=build-system/appstore-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+
+          IPA_PATH=$(find bazel-out -path '*/bin/Telegram/Swiftgram.ipa' -print -quit)
+          test -n "$IPA_PATH"
+          mkdir -p build/artifacts
+          cp "$IPA_PATH" build/artifacts/AyuGram.ipa
+          printf '%s' 'LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUlJQm9qQU5CZ2txaGtpRzl3MEJBUUVGQUFPQ0FZOEFNSUlCaWdLQ0FZRUEzdHBta2dBQUtoNVN2Ni9qYm4ySwovYXJpelVQS1JYZXpKMExIQ0dYOWdPMEdVd2gvWUdwWGRrWjdkRnRYTzZqTTk5OTBsU1BoeDNkTFZtQXR5MTgwCkxWcHlnWFNNcGlQd242Q3dlQ0ErS2RheXlOV1VjY1BRQ3RDTWh3T0YzSjdXbVc2WVZETEtRaTZWaStRQ1dIVWQKNURTWEhtWERsR0lTTnd5eDlmWUVxN3BKc0RhK0tJTmJxVVA5M1NJYjE1c1FuS2tMbnhLT1VSWWlmYXNWTXl0MQpjVitMSCtVaFFkMVdZZGxLWkIxYW5YQUJYRlN2OHo0eFN6bEdBd0tHUmh5K3lIdEwrMjFGeVFacEVoOUpGS28vCk5NaGU5ODRYYkJGcCtENkZGcEFFTXU3dGxubHNnWHdDOXAzNmp5TEJhQ1dHUVpxbHdLS1orOVFmWEg0RnpJY0MKRjQrajE2RCtzVHd5UTFvZTlwT3pSb0lETEtnUGIyQUltc3dYMGNySzEyZjg2SUlXVXovZjZ2Y3NDTG5zR3libApGSkZLNlpaSjVEYTdpQ2lFZURHMFdRVnVQR1lWSXQrVWtFMXV5dUMyOGZDNVFFaVVRY2sxaE9XZDNXT3EzZGt1CmRwN2JwY0pHRDJ1U2toVWlYNG5meXJ6bktEeE1YVldWMnJQbFdZNGQxaXV4QWdNQkFBRT0KLS0tLS1FTkQgUFVCTElDIEtFWS0tLS0tCg==' | base64 --decode > build/artifacts/public-key.pem
+          openssl rand 32 > build/artifacts/aes.key
+          openssl rand 16 > build/artifacts/iv.bin
+          AES_KEY=$(xxd -p -c 256 build/artifacts/aes.key)
+          AES_IV=$(xxd -p -c 256 build/artifacts/iv.bin)
+          openssl enc -aes-256-cbc -K "$AES_KEY" -iv "$AES_IV" -in build/artifacts/AyuGram.ipa -out build/artifacts/AyuGram.ipa.enc
+          openssl pkeyutl -encrypt -pubin -inkey build/artifacts/public-key.pem -in build/artifacts/aes.key -out build/artifacts/aes.key.enc -pkeyopt rsa_padding_mode:oaep
+          rm build/artifacts/AyuGram.ipa build/artifacts/aes.key build/artifacts/public-key.pem
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AyuGram-iOS-encrypted-${{ env.BUILD_NUMBER }}
+          path: |
+            /Users/Shared/telegram-ios/build/artifacts/AyuGram.ipa.enc
+            /Users/Shared/telegram-ios/build/artifacts/aes.key.enc
+            /Users/Shared/telegram-ios/build/artifacts/iv.bin
+
+      - name: Create encrypted public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG=encrypted-build-${BUILD_NUMBER}-${GITHUB_RUN_NUMBER}
+          gh release create "$TAG" \
+            /Users/Shared/telegram-ios/build/artifacts/AyuGram.ipa.enc \
+            /Users/Shared/telegram-ios/build/artifacts/aes.key.enc \
+            /Users/Shared/telegram-ios/build/artifacts/iv.bin \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "AyuGram iOS encrypted ${APP_VERSION} (${BUILD_NUMBER})" \
+            --notes "Encrypted unsigned IPA. Only the matching private key can decrypt it."
